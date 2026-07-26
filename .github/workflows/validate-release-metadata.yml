@@ -9,9 +9,11 @@ on:
 jobs:
   validate-release-metadata:
     runs-on: windows-latest
+    permissions:
+      contents: read
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Validate version and changelog sync
         shell: pwsh
