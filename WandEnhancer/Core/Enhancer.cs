@@ -150,7 +150,16 @@ namespace WandEnhancer.Core
                 
                 foreach (var entry in remainingPatches.ToList())
                 {
-                    var entries = enhancerConfig[entry];
+                    // Not every EPatchType has an implementation in EnhancerConfig. Such a
+                    // type stays in remainingPatches so it is reported by the summary below,
+                    // rather than taking down the whole run with a KeyNotFoundException.
+                    EnhancerConfig.PatchEntry[] entries;
+                    if (!enhancerConfig.TryGetValue(entry, out entries))
+                    {
+                        _logger($"[ENHANCER] No patch definition for {entry}, skipping", ELogType.Warn);
+                        continue;
+                    }
+
                     foreach (var patchEntry in entries)
                     {
                         bool patchApplied;
@@ -189,7 +198,13 @@ namespace WandEnhancer.Core
         {
             foreach (var patchType in remainingPatches)
             {
-                foreach (var patchEntry in enhancerConfig[patchType])
+                EnhancerConfig.PatchEntry[] entries;
+                if (!enhancerConfig.TryGetValue(patchType, out entries))
+                {
+                    continue;
+                }
+
+                foreach (var patchEntry in entries)
                 {
                     if (patchEntry.Applied)
                     {
