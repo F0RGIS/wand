@@ -46,8 +46,10 @@ namespace AsarSharp.Integrity
 
         public static FileIntegrity GetFileIntegrity(string path, byte[] reusableBuffer = null)
         {
-            bool ownBuffer = reusableBuffer == null;
-            if (ownBuffer) reusableBuffer = new byte[BLOCK_SIZE];
+            // A block must be exactly BLOCK_SIZE for Electron to validate it, so a buffer
+            // that cannot hold a whole block is replaced rather than used as-is.
+            if (reusableBuffer == null || reusableBuffer.Length < BLOCK_SIZE)
+                reusableBuffer = new byte[BLOCK_SIZE];
 
             using (var fileStream = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.Read,
                        65536, FileOptions.SequentialScan))
@@ -58,13 +60,27 @@ namespace AsarSharp.Integrity
                     ? (int)((fileStream.Length + BLOCK_SIZE - 1) / BLOCK_SIZE)
                     : 0;
                 var blockHashes = new List<string>(estimatedBlockCount);
+                int blockFill = 0;
                 int bytesRead;
 
-                while ((bytesRead = fileStream.Read(reusableBuffer, 0, reusableBuffer.Length)) > 0)
+                // Stream.Read may return fewer bytes than requested at any point, so reads
+                // accumulate into the block buffer and a hash is only emitted once a full
+                // block is present. Hashing each read directly would turn a short read into
+                // an undersized block and desynchronise every boundary after it.
+                while ((bytesRead = fileStream.Read(reusableBuffer, blockFill, BLOCK_SIZE - blockFill)) > 0)
                 {
-                    blockHashes.Add(ToLowerHex(blockHash.ComputeHash(reusableBuffer, 0, bytesRead)));
-                    fileHash.AppendData(reusableBuffer, 0, bytesRead);
+                    fileHash.AppendData(reusableBuffer, blockFill, bytesRead);
+                    blockFill += bytesRead;
+
+                    if (blockFill == BLOCK_SIZE)
+                    {
+                        blockHashes.Add(ToLowerHex(blockHash.ComputeHash(reusableBuffer, 0, BLOCK_SIZE)));
+                        blockFill = 0;
+                    }
                 }
+
+                if (blockFill > 0)
+                    blockHashes.Add(ToLowerHex(blockHash.ComputeHash(reusableBuffer, 0, blockFill)));
 
                 return new FileIntegrity
                 {
