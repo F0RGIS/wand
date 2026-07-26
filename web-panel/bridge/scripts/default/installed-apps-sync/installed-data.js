@@ -22,7 +22,10 @@ import {
 export function resolveInstalledData(state) {
   const storeState = getStoreState(state.storeRef)
 
-  if (isRecord(state.installedAppsService?.installedApps)) {
+  // A populated slice is required, not merely a present one: the service starts with
+  // an empty installedApps object and only fills it in refreshApps. Accepting {} here
+  // would take this branch with nothing to match and skip the store fallback below.
+  if (isNonEmptyRecord(state.installedAppsService?.installedApps)) {
     return {
       rawInstalledApps: state.installedAppsService.installedApps,
       catalog: isRecord(state.installedAppsService.catalog)
@@ -351,6 +354,10 @@ export function getInstalledVersionsForGame(gameId, data) {
   )
 }
 
+function isNonEmptyRecord(value) {
+  return isRecord(value) && Object.keys(value).length > 0
+}
+
 function getStoreState(storeRef) {
   const state =
     typeof storeRef?.state?.getValue === "function"
@@ -561,17 +568,19 @@ function pickImageUrlForTitle(title, game, preferredApp, sidebarClientIconUrl, v
     : [title, game, preferredApp]
 
   return pickImageUrl(
+    // The Wand client icon CDN wins whenever a Steam AppID is resolvable, on any
+    // install platform. It yields null when no AppID is found, so the metadata
+    // candidates below still apply to non-Steam titles.
+    getSteamClientIconUrl(
+      findSteamAppId(...steamRoots),
+      getInstalledAppSteamAppId(preferredApp.platform, preferredApp.sku)
+    ),
     title?.imageUrl,
     title?.iconUrl,
     title?.coverUrl,
     title?.thumbnailUrl,
     title?.logoUrl,
     title?.headerImageUrl,
-    getSteamClientIconUrl(
-      findSteamAppId(...steamRoots),
-      getInstalledAppSteamAppId(preferredApp.platform, preferredApp.sku)
-    ),
-    sidebarClientIconUrl,
     title?.images,
     title?.assets,
     game.imageUrl,
@@ -582,6 +591,9 @@ function pickImageUrlForTitle(title, game, preferredApp, sidebarClientIconUrl, v
     game.headerImageUrl,
     game.images,
     game.assets,
-    preferredApp.imageUrl
+    preferredApp.imageUrl,
+    // Scraped from the rendered sidebar, so it is the last resort once no
+    // metadata source exposed artwork.
+    sidebarClientIconUrl
   )
 }
