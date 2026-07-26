@@ -29,6 +29,11 @@ namespace WandEnhancer.Core.Services
         private static CultureInfo _currentLanguage;
         private static ResourceDictionary _englishBaseDictionary;
 
+        // The locale dictionary currently merged into the application resources. It is built in
+        // code and therefore has no Source, so it cannot be found again by the Source-based lookup
+        // below; tracking it here is what allows the previous one to be removed on every switch.
+        private static ResourceDictionary _currentLocaleDictionary;
+
         public static CultureInfo CurrentLanguage
         {
             get => _currentLanguage;
@@ -104,20 +109,27 @@ namespace WandEnhancer.Core.Services
                 localeDict[entry.Key] = targetDict[entry.Key];
             }
 
-            // Find and replace the old locale dictionary
-            var oldDict = Application.Current.Resources.MergedDictionaries
+            // Find and replace the old locale dictionary. The tracked instance is checked first
+            // because only the very first replacement targets the Source-bearing dictionary merged
+            // by App.xaml; every later one targets a code-built dictionary with no Source.
+            var oldDict = _currentLocaleDictionary ?? Application.Current.Resources.MergedDictionaries
                 .FirstOrDefault(d => d.Source != null && d.Source.OriginalString.StartsWith("Locale/lang."));
 
-            if (oldDict != null)
+            var index = oldDict != null
+                ? Application.Current.Resources.MergedDictionaries.IndexOf(oldDict)
+                : -1;
+
+            if (index >= 0)
             {
-                var index = Application.Current.Resources.MergedDictionaries.IndexOf(oldDict);
-                Application.Current.Resources.MergedDictionaries.Remove(oldDict);
+                Application.Current.Resources.MergedDictionaries.RemoveAt(index);
                 Application.Current.Resources.MergedDictionaries.Insert(index, localeDict);
             }
             else
             {
                 Application.Current.Resources.MergedDictionaries.Add(localeDict);
             }
+
+            _currentLocaleDictionary = localeDict;
             
             if (saveSettings)
             {
