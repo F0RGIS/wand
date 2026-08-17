@@ -1,0 +1,145 @@
+name: Sync upstream and build
+
+# Watches k1tbyte/Wand-Enhancer for new releases. When one appears:
+#   1. force-syncs this fork's master (and tags) to upstream
+#   2. builds WandEnhancer.exe on Windows
+#   3. publishes a release here with the .exe attached
+#
+# Watch this repo (Custom -> Releases) and GitHub emails you when step 3 lands.
+# Scheduled-run failures are emailed by GitHub automatically.
+#
+# State is kept in this fork's own releases: if a release with the upstream
+# tag already exists here, the run is a no-op. No extra files or branches.
+
+on:
+  schedule:
+    - cron: '0 6 * * *'   # 06:00 UTC daily (07:00 London in summer, 06:00 in winter)
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Build even if this release was already built here'
+        type: boolean
+        default: false
+
+concurrency:
+  group: sync-upstream-and-build
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: k1tbyte/Wand-Enhancer
+  UPSTREAM_BRANCH: master
+
+jobs:
+  check-and-sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.check.outputs.tag }}
+      should_build: ${{ steps.check.outputs.should_build }}
+    steps:
+      - name: Find latest upstream release
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          set -euo pipefail
+
+          TAG=$(gh api "repos/$UPSTREAM_REPO/releases/latest" --jq '.tag_name' 2>/dev/null || true)
+          if [ -z "$TAG" ]; then
+            echo "::warning::No published release found on $UPSTREAM_REPO — nothing to do."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "Latest upstream release: $TAG"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+          if [ "$FORCE" = "true" ]; then
+            echo "Forced run — building regardless of existing release."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "Release $TAG already exists in this fork — already built. Skipping."
+            echo "should_build=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "New upstream release $TAG — syncing and building."
+            echo "should_build=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout fork
+        if: steps.check.outputs.should_build == 'true'
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+          # A PAT with `repo` + `workflow` scope. Required: the default
+          # GITHUB_TOKEN is not allowed to push changes to files under
+          # .github/workflows/, so a sync that touches upstream's workflows
+          # would fail without it.
+          token: ${{ secrets.SYNC_TOKEN || github.token }}
+          persist-credentials: true
+
+      - name: Force-sync fork to upstream
+        if: steps.check.outputs.should_build == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          git remote add upstream "https://github.com/$UPSTREAM_REPO.git"
+          git fetch upstream --prune --tags --force
+
+          # Hard reset of this fork's default branch onto upstream.
+          git push origin "refs/remotes/upstream/$UPSTREAM_BRANCH:refs/heads/$UPSTREAM_BRANCH" --force
+          git push origin --tags --force
+
+          echo "Synced $UPSTREAM_BRANCH to $(git rev-parse --short "upstream/$UPSTREAM_BRANCH")"
+
+  build:
+    needs: check-and-sync
+    if: needs.check-and-sync.outputs.should_build == 'true'
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ needs.check-and-sync.outputs.tag }}
+          fetch-depth: 0
+
+      - uses: pnpm/action-setup@v5
+        with:
+          version: 10.17.0
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: web-panel/pnpm-lock.yaml
+
+      - name: Build unsigned executable
+        shell: pwsh
+        run: ./build.ps1 -Configuration Release
+
+      - name: Upload unsigned executable
+        uses: actions/upload-artifact@v6
+        with:
+          name: WandEnhancer-unsigned-${{ needs.check-and-sync.outputs.tag }}
+          path: WandEnhancer/bin/Release/WandEnhancer.exe
+          if-no-files-found: error
+
+      - name: Publish release in this fork
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-and-sync.outputs.tag }}
+          name: ${{ needs.check-and-sync.outputs.tag }}
+          body: |
+            Automated build of upstream release
+            [${{ needs.check-and-sync.outputs.tag }}](https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${{ needs.check-and-sync.outputs.tag }}).
+
+            Built from source by [this workflow run](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}).
+            The executable is unsigned — Windows SmartScreen will warn on first run.
+          files: WandEnhancer/bin/Release/WandEnhancer.exe
+          fail_on_unmatched_files: true
