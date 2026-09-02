@@ -94,7 +94,7 @@ namespace WandEnhancer
             // RecordStartupLog, not LauncherLog.Write: whatever the launcher says has to survive
             // into the window on the failure path below.
             ProcessTerminator.TryKillProcess(config.BrandName);
-            return FuseLauncher.Launch(config.ExecutablePath, forwardedArgs, RecordStartupLog);
+            FuseLauncher.Launch(config.ExecutablePath, forwardedArgs, message => RecordStartupLog(message, ELogType.Warn));
         }
 
 
