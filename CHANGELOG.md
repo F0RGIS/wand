@@ -3,6 +3,12 @@
 This file is the source of truth for release notes.
 The newest entry must match the version in `WandEnhancer/Properties/AssemblyInfo.cs`.
 
+## [2.0.0.1] - 2026-09-02
+
+### Fixes
+
+- Fixed Wand failing to open or remaining on a black screen after enhancing. The 2.0 launcher could discover Electron child processes too late, after they had already started validating the patched `app.asar` and exited with code `-36861`. Wand processes are now intercepted before their first user-mode instruction so the ASAR-integrity fuse is cleared before Electron can perform that check; non-Wand children are detached immediately.
+
 ## [2.0.0.0] - 2026-08-29
 
 ### Important

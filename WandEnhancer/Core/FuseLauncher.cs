@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 using WandEnhancer.View.MainWindow;
@@ -7,15 +8,10 @@ using WandEnhancer.View.MainWindow;
 namespace WandEnhancer.Core
 {
     /// <summary>
-    /// Starts Wand and keeps the ASAR integrity fuse cleared in every process Electron spawns,
-    /// for as long as Wand runs. Covering only the startup burst is not enough: the renderer
-    /// behind the in-game overlay is created when a game launches, and exits with -36861 the
-    /// moment it opens the patched archive, leaving the overlay dead while Wand itself looks
-    /// healthy.
-    /// Wand is put in a job object, which every descendant joins on its own, and the kernel
-    /// posts each new process to a completion port. A debugger would report the same events, but
-    /// it is inherited too - by a game started from Wand included - and games treat a debug port
-    /// as tampering. Nothing here is attached to the game beyond reading its image path.
+    /// Starts Wand as a debugger so every Electron process is stopped before its first user-mode
+    /// instruction. The ASAR-integrity fuse is cleared at the CREATE_PROCESS debug event and the
+    /// process is then allowed to run. Descendants whose image is not Wand.exe are detached at
+    /// that same event, before their code executes, so games do not retain a debug port.
     /// </summary>
     internal static class FuseLauncher
     {
@@ -25,217 +21,213 @@ namespace WandEnhancer.Core
         public static bool Launch(string exePath, string args, Action<string, ELogType> log = null)
         {
             long stateRva = ElectronFuse.FindStateRva(exePath);
+            if (stateRva < 0)
+            {
+                log?.Invoke($"No Electron fuse block in {exePath}. A patched Wand will exit " +
+                            $"with {AsarIntegrityExitCode}; an unpatched one is unaffected.", ELogType.Error);
+                return false;
+            }
 
             var startupInfo = new STARTUPINFO { cb = Marshal.SizeOf<STARTUPINFO>() };
             var commandLine = new StringBuilder(
                 string.IsNullOrEmpty(args) ? $"\"{exePath}\"" : $"\"{exePath}\" {args}");
 
-            // Suspended, so the fuse is cleared and the job is attached before Wand runs its
-            // first instruction. Every child is then born inside the job.
-            if (!CreateProcessW(null, commandLine, IntPtr.Zero, IntPtr.Zero, false, CREATE_SUSPENDED,
-                    IntPtr.Zero, System.IO.Path.GetDirectoryName(exePath), ref startupInfo, out var info))
+            if (!CreateProcessW(null, commandLine, IntPtr.Zero, IntPtr.Zero, false, DEBUG_PROCESS,
+                    IntPtr.Zero, Path.GetDirectoryName(exePath), ref startupInfo, out var info))
             {
-                log?.Invoke($"Could not start Wand (win32 error {Marshal.GetLastWin32Error()}).", ELogType.Error);
+                log?.Invoke($"Could not start Wand under the fuse patcher " +
+                            $"(win32 error {Marshal.GetLastWin32Error()}).", ELogType.Error);
                 return false;
             }
 
-            IntPtr job = IntPtr.Zero;
-            IntPtr port = IntPtr.Zero;
-            bool resumed = false;
+            // A launcher failure must not terminate every process still being debugged.
+            DebugSetProcessKillOnExit(false);
+            CloseHandle(info.hThread);
+            CloseHandle(info.hProcess);
+            log?.Invoke($"Started {exePath} as pid {info.dwProcessId}.", ELogType.Info);
 
-            try
-            {
-                log?.Invoke($"Started {exePath} as pid {info.dwProcessId}.", ELogType.Info);
-
-                if (stateRva < 0)
-                {
-                    log?.Invoke($"No Electron fuse block in {exePath}. A patched Wand will exit " +
-                                $"with {AsarIntegrityExitCode}; an unpatched one is unaffected.", ELogType.Error);
-                    return false;
-                }
-
-                bool mainCleared = ElectronFuse.ClearIn(info.hProcess, stateRva);
-                log?.Invoke(mainCleared
-                        ? $"pid {info.dwProcessId} started - fuse cleared."
-                        : $"Fuse not cleared in pid {info.dwProcessId}; it may exit with {AsarIntegrityExitCode}.",
-                    mainCleared ? ELogType.Info : ELogType.Warn);
-
-                if (!TryTrackChildren(info.hProcess, out job, out port))
-                {
-                    log?.Invoke($"Could not watch Wand for new processes (win32 error {Marshal.GetLastWin32Error()}). " +
-                                "Wand will run, but the in-game overlay will not.", ELogType.Error);
-                    return false;
-                }
-
-                ResumeThread(info.hThread);
-                resumed = true;
-
-                ClearFuseInNewProcesses(port, exePath, stateRva, info.dwProcessId, mainCleared, log);
-
-                if (!GetExitCodeProcess(info.hProcess, out int exitCode))
-                {
-                    log?.Invoke("Wand exited, and its exit code could not be read.", ELogType.Error);
-                    return false;
-                }
-
-                log?.Invoke($"Wand exited with code {DescribeCode(exitCode)}.",
-                    exitCode == 0 ? ELogType.Info : ELogType.Error);
-                return exitCode == 0;
-            }
-            finally
-            {
-                if (!resumed)
-                {
-                    ResumeThread(info.hThread);
-                }
-
-                CloseHandle(info.hThread);
-                CloseHandle(info.hProcess);
-                if (port != IntPtr.Zero)
-                {
-                    CloseHandle(port);
-                }
-
-                if (job != IntPtr.Zero)
-                {
-                    CloseHandle(job);
-                }
-            }
+            return DriveDebugLoop(info.dwProcessId, exePath, stateRva, log);
         }
 
-        /// <summary>
-        /// No limits are set on the job: it exists only to be told about new processes. That also
-        /// keeps KILL_ON_JOB_CLOSE off, so Wand outlives the launcher rather than dying with it.
-        /// </summary>
-        private static bool TryTrackChildren(IntPtr process, out IntPtr job, out IntPtr port)
+        private static bool DriveDebugLoop(
+            int mainProcessId, string exePath, long stateRva, Action<string, ELogType> log)
         {
-            port = IntPtr.Zero;
-            job = CreateJobObject(IntPtr.Zero, null);
-            if (job == IntPtr.Zero)
+            var wandProcesses = new HashSet<int>();
+            var initialBreakpoints = new HashSet<int>();
+            var debugEvent = new byte[DebugEventSize];
+            int created = 0;
+            int cleared = 0;
+            int missed = 0;
+            bool healthy = true;
+
+            while (true)
             {
-                return false;
-            }
-
-            port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, IntPtr.Zero, UIntPtr.Zero, 1);
-            if (port == IntPtr.Zero)
-            {
-                return false;
-            }
-
-            var association = new JOBOBJECT_ASSOCIATE_COMPLETION_PORT { CompletionKey = IntPtr.Zero, CompletionPort = port };
-            return SetInformationJobObject(job, JobObjectAssociateCompletionPortInformation,
-                       ref association, Marshal.SizeOf(association))
-                   && AssignProcessToJobObject(job, process);
-        }
-
-        /// <summary>Blocks until the last process in the job is gone.</summary>
-        private static void ClearFuseInNewProcesses(IntPtr port, string exePath, long stateRva,
-            int mainProcessId, bool mainCleared, Action<string, ELogType> log)
-        {
-            var tracked = new Dictionary<int, IntPtr>();
-            int cleared = mainCleared ? 1 : 0;
-            int missed = mainCleared ? 0 : 1;
-
-            try
-            {
-                while (GetQueuedCompletionStatus(port, out uint message, out _, out IntPtr value, INFINITE))
+                if (!WaitForDebugEvent(debugEvent, INFINITE))
                 {
-                    if (message == JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO)
-                    {
+                    log?.Invoke($"Waiting for a Wand process failed " +
+                                $"(win32 error {Marshal.GetLastWin32Error()}).", ELogType.Error);
+                    healthy = false;
+                    break;
+                }
+
+                int code = BitConverter.ToInt32(debugEvent, OffsetDebugEventCode);
+                int processId = BitConverter.ToInt32(debugEvent, OffsetProcessId);
+                int threadId = BitConverter.ToInt32(debugEvent, OffsetThreadId);
+                uint status = DBG_CONTINUE;
+                bool detachInsteadOfContinue = false;
+                bool mainExited = false;
+
+                switch (code)
+                {
+                    case CREATE_PROCESS_DEBUG_EVENT:
+                        var imageFile = (IntPtr)BitConverter.ToInt64(debugEvent, OffsetCreateProcessFile);
+                        var process = (IntPtr)BitConverter.ToInt64(debugEvent, OffsetCreateProcessHandle);
+                        var imageBase = (IntPtr)BitConverter.ToInt64(debugEvent, OffsetCreateProcessImageBase);
+
+                        if (IsImage(imageFile, process, exePath))
+                        {
+                            wandProcesses.Add(processId);
+                            created++;
+
+                            if (ElectronFuse.ClearAtImageBase(
+                                    process, imageBase, stateRva, out string failure))
+                            {
+                                cleared++;
+                                log?.Invoke($"pid {processId} started - fuse cleared before execution.",
+                                    ELogType.Info);
+                            }
+                            else
+                            {
+                                missed++;
+                                healthy = false;
+                                log?.Invoke($"Fuse not cleared in pid {processId}: {failure}. It may exit " +
+                                            $"with {AsarIntegrityExitCode}.", ELogType.Error);
+                            }
+                        }
+                        else
+                        {
+                            // DEBUG_PROCESS also reports games launched by Wand. Detach this one
+                            // while its create event still has every thread stopped.
+                            detachInsteadOfContinue = true;
+                        }
+
+                        if (imageFile != IntPtr.Zero)
+                        {
+                            CloseHandle(imageFile);
+                        }
                         break;
-                    }
 
-                    int processId = value.ToInt32();
-                    if (message == JOB_OBJECT_MSG_EXIT_PROCESS || message == JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS)
-                    {
-                        ReportExit(tracked, processId, log);
-                        continue;
-                    }
+                    case LOAD_DLL_DEBUG_EVENT:
+                        var loadedFile = (IntPtr)BitConverter.ToInt64(debugEvent, OffsetUnion);
+                        if (loadedFile != IntPtr.Zero)
+                        {
+                            CloseHandle(loadedFile);
+                        }
+                        break;
 
-                    // The main process is announced here too, having been patched while it was
-                    // still suspended, and a game started from Wand joins the job like any child.
-                    if (message != JOB_OBJECT_MSG_NEW_PROCESS || processId == mainProcessId ||
-                        !IsImage(processId, exePath))
-                    {
-                        continue;
-                    }
+                    case EXCEPTION_DEBUG_EVENT:
+                        int exceptionCode = BitConverter.ToInt32(debugEvent, OffsetExceptionCode);
+                        status = exceptionCode == EXCEPTION_BREAKPOINT && initialBreakpoints.Add(processId)
+                            ? DBG_CONTINUE
+                            : DBG_EXCEPTION_NOT_HANDLED;
 
-                    // The handle is kept open: it is what makes the exit code readable later, and
-                    // it also stops Windows handing the pid to someone else in the meantime.
-                    IntPtr process = OpenProcess(ProcessAccess, false, processId);
-                    if (process != IntPtr.Zero)
-                    {
-                        tracked[processId] = process;
-                    }
+                        if (BitConverter.ToInt32(debugEvent, OffsetExceptionFirstChance) == 0)
+                        {
+                            log?.Invoke($"pid {processId} hit an unhandled exception: " +
+                                        $"{DescribeCode(exceptionCode)}.", ELogType.Error);
+                            healthy = false;
+                        }
+                        break;
 
-                    if (process != IntPtr.Zero && ElectronFuse.ClearIn(process, stateRva))
-                    {
-                        cleared++;
-                        log?.Invoke($"pid {processId} started - fuse cleared.", ELogType.Info);
-                    }
-                    else
-                    {
-                        missed++;
-                        log?.Invoke($"Fuse not cleared in pid {processId}; it may exit with {AsarIntegrityExitCode}.",
-                            ELogType.Warn);
-                    }
+                    case EXIT_PROCESS_DEBUG_EVENT:
+                        int exitCode = BitConverter.ToInt32(debugEvent, OffsetExitCode);
+                        wandProcesses.Remove(processId);
+                        initialBreakpoints.Remove(processId);
+
+                        if (exitCode != 0)
+                        {
+                            log?.Invoke($"pid {processId} exited with code {DescribeCode(exitCode)}.",
+                                ELogType.Error);
+                            if (exitCode == AsarIntegrityExitCode || processId == mainProcessId)
+                            {
+                                healthy = false;
+                            }
+                        }
+
+                        mainExited = processId == mainProcessId;
+                        break;
                 }
-            }
-            finally
-            {
-                foreach (var handle in tracked.Values)
+
+                if (detachInsteadOfContinue)
                 {
-                    CloseHandle(handle);
+                    if (!DebugActiveProcessStop(processId))
+                    {
+                        int error = Marshal.GetLastWin32Error();
+                        ContinueDebugEvent(processId, threadId, status);
+                        log?.Invoke($"Could not detach non-Wand child pid {processId} before execution " +
+                                    $"(win32 error {error}).", ELogType.Warn);
+                    }
+                }
+                else
+                {
+                    ContinueDebugEvent(processId, threadId, status);
+                }
+
+                if (mainExited)
+                {
+                    break;
                 }
             }
 
-            log?.Invoke($"Wand closed: fuse cleared in {cleared} processes" + (missed == 0 ? "." : $", {missed} missed."),
-                missed == 0 ? ELogType.Info : ELogType.Warn);
+            foreach (int processId in wandProcesses)
+            {
+                DebugActiveProcessStop(processId);
+            }
+
+            log?.Invoke($"Wand closed: fuse cleared in {cleared} of {created} processes" +
+                        (missed == 0 ? "." : $", {missed} missed."),
+                missed == 0 ? ELogType.Info : ELogType.Error);
+            return healthy && created > 0 && missed == 0;
         }
 
-        /// <summary>
-        /// Only anomalies are reported: on a normal shutdown every process exits with 0, and a
-        /// line each would bury the one death that matters.
-        /// </summary>
-        private static void ReportExit(Dictionary<int, IntPtr> tracked, int processId, Action<string, ELogType> log)
+        private static bool IsImage(IntPtr imageFile, IntPtr process, string exePath)
         {
-            if (!tracked.TryGetValue(processId, out IntPtr process))
+            string path = GetImagePath(imageFile);
+            if (path == null)
             {
-                return;
+                var buffer = new StringBuilder(MaxPathLength);
+                int length = buffer.Capacity;
+                if (!QueryFullProcessImageName(process, 0, buffer, ref length))
+                {
+                    return false;
+                }
+
+                path = buffer.ToString();
             }
 
-            tracked.Remove(processId);
-            if (GetExitCodeProcess(process, out int exitCode) && exitCode != 0)
+            if (path.StartsWith(@"\\?\", StringComparison.Ordinal))
             {
-                log?.Invoke($"pid {processId} exited with code {DescribeCode(exitCode)}.", ELogType.Error);
+                path = path.Substring(4);
             }
 
-            CloseHandle(process);
+            return string.Equals(path, exePath, StringComparison.OrdinalIgnoreCase);
         }
 
-        /// <summary>
-        /// Identity check before anything heavier: a game started from Wand is in the job as well,
-        /// and is opened for nothing beyond the right the task manager uses to read a path.
-        /// </summary>
-        private static bool IsImage(int processId, string exePath)
+        private static string GetImagePath(IntPtr imageFile)
         {
-            IntPtr process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, processId);
-            if (process == IntPtr.Zero)
+            if (imageFile == IntPtr.Zero)
             {
-                return false;
+                return null;
             }
 
-            try
+            var buffer = new StringBuilder(MaxPathLength);
+            uint length = GetFinalPathNameByHandle(imageFile, buffer, (uint)buffer.Capacity, 0);
+            if (length == 0 || length >= buffer.Capacity)
             {
-                var path = new StringBuilder(MaxPathLength);
-                int length = path.Capacity;
-                return QueryFullProcessImageName(process, 0, path, ref length) &&
-                       string.Equals(path.ToString(), exePath, StringComparison.OrdinalIgnoreCase);
+                return null;
             }
-            finally
-            {
-                CloseHandle(process);
-            }
+
+            return buffer.ToString();
         }
 
         private static string DescribeCode(int code)
@@ -245,7 +237,6 @@ namespace WandEnhancer.Core
                 case 0: return "0";
                 case AsarIntegrityExitCode:
                     return $"{code} (ASAR integrity check failed - the fuse was not cleared in time)";
-                // Chromium breaks into a debugger that is not there when it hits a fatal error.
                 case unchecked((int)0x80000003): return $"0x{code:X8} (Wand aborted itself during startup)";
                 case unchecked((int)0xC0000005): return $"0x{code:X8} (access violation)";
                 case unchecked((int)0xC0000135): return $"0x{code:X8} (a required DLL is missing)";
@@ -257,17 +248,29 @@ namespace WandEnhancer.Core
 
         #region P/Invoke
 
-        private const uint CREATE_SUSPENDED = 0x4;
-        private const uint ProcessAccess = 0x0008 | 0x0010 | 0x0020 | 0x0400;
-        private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
-        private const int MaxPathLength = 260;
-        private const int JobObjectAssociateCompletionPortInformation = 7;
-        private const uint JOB_OBJECT_MSG_ACTIVE_PROCESS_ZERO = 4;
-        private const uint JOB_OBJECT_MSG_NEW_PROCESS = 6;
-        private const uint JOB_OBJECT_MSG_EXIT_PROCESS = 7;
-        private const uint JOB_OBJECT_MSG_ABNORMAL_EXIT_PROCESS = 8;
-        private const uint INFINITE = 0xFFFFFFFF;
-        private static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+        // x64 DEBUG_EVENT: three DWORDs plus padding, followed by its native union.
+        private const int DebugEventSize = 192;
+        private const int OffsetDebugEventCode = 0;
+        private const int OffsetProcessId = 4;
+        private const int OffsetThreadId = 8;
+        private const int OffsetUnion = 16;
+        private const int OffsetExceptionCode = OffsetUnion;
+        private const int OffsetExceptionFirstChance = OffsetUnion + 152;
+        private const int OffsetExitCode = OffsetUnion;
+        private const int OffsetCreateProcessFile = OffsetUnion;
+        private const int OffsetCreateProcessHandle = OffsetUnion + 8;
+        private const int OffsetCreateProcessImageBase = OffsetUnion + 24;
+
+        private const uint DEBUG_PROCESS = 0x00000001;
+        private const uint DBG_CONTINUE = 0x00010002;
+        private const uint DBG_EXCEPTION_NOT_HANDLED = 0x80010001;
+        private const int EXCEPTION_DEBUG_EVENT = 1;
+        private const int CREATE_PROCESS_DEBUG_EVENT = 3;
+        private const int EXIT_PROCESS_DEBUG_EVENT = 5;
+        private const int LOAD_DLL_DEBUG_EVENT = 6;
+        private const int EXCEPTION_BREAKPOINT = unchecked((int)0x80000003);
+        private const int INFINITE = -1;
+        private const int MaxPathLength = 32768;
 
         [StructLayout(LayoutKind.Sequential)]
         private struct STARTUPINFO
@@ -287,13 +290,6 @@ namespace WandEnhancer.Core
             public int dwProcessId, dwThreadId;
         }
 
-        [StructLayout(LayoutKind.Sequential)]
-        private struct JOBOBJECT_ASSOCIATE_COMPLETION_PORT
-        {
-            public IntPtr CompletionKey;
-            public IntPtr CompletionPort;
-        }
-
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         private static extern bool CreateProcessW(
             string lpApplicationName, StringBuilder lpCommandLine,
@@ -303,37 +299,25 @@ namespace WandEnhancer.Core
             out PROCESS_INFORMATION lpProcessInformation);
 
         [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern uint ResumeThread(IntPtr hThread);
+        private static extern bool WaitForDebugEvent(byte[] lpDebugEvent, int dwMilliseconds);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool ContinueDebugEvent(
+            int dwProcessId, int dwThreadId, uint dwContinueStatus);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool DebugActiveProcessStop(int dwProcessId);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool DebugSetProcessKillOnExit(bool killOnExit);
 
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
-        private static extern IntPtr CreateJobObject(IntPtr lpJobAttributes, string lpName);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool SetInformationJobObject(
-            IntPtr hJob, int jobObjectInformationClass,
-            ref JOBOBJECT_ASSOCIATE_COMPLETION_PORT lpJobObjectInformation, int cbJobObjectInformationLength);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr CreateIoCompletionPort(
-            IntPtr fileHandle, IntPtr existingCompletionPort, UIntPtr completionKey, uint numberOfConcurrentThreads);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool GetQueuedCompletionStatus(
-            IntPtr completionPort, out uint lpNumberOfBytes, out IntPtr lpCompletionKey,
-            out IntPtr lpOverlapped, uint dwMilliseconds);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, int dwProcessId);
+        private static extern uint GetFinalPathNameByHandle(
+            IntPtr hFile, StringBuilder lpszFilePath, uint cchFilePath, uint dwFlags);
 
         [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         private static extern bool QueryFullProcessImageName(
             IntPtr hProcess, uint dwFlags, StringBuilder lpExeName, ref int lpdwSize);
-
-        [DllImport("kernel32.dll", SetLastError = true)]
-        private static extern bool GetExitCodeProcess(IntPtr hProcess, out int lpExitCode);
 
         [DllImport("kernel32.dll")]
         private static extern bool CloseHandle(IntPtr hObject);
