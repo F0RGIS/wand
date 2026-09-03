@@ -51,9 +51,33 @@ namespace WandEnhancer.Core
         /// </summary>
         public static bool ClearIn(IntPtr process, long stateRva)
         {
+            return ClearIn(process, stateRva, out _);
+        }
+
+        public static bool ClearIn(IntPtr process, long stateRva, out string failure)
+        {
             IntPtr imageBase = GetImageBase(process);
             if (imageBase == IntPtr.Zero)
             {
+                failure = "image base is not available yet";
+                return false;
+            }
+
+            return ClearAtImageBase(process, imageBase, stateRva, out failure);
+        }
+
+        /// <summary>
+        /// Clears the fuse while a CREATE_PROCESS_DEBUG_EVENT has the process suspended. The
+        /// event supplies the mapped image base directly, before any Electron code can inspect
+        /// the archive.
+        /// </summary>
+        public static bool ClearAtImageBase(
+            IntPtr process, IntPtr imageBase, long stateRva, out string failure)
+        {
+            failure = null;
+            if (imageBase == IntPtr.Zero)
+            {
+                failure = "debug event did not provide an image base";
                 return false;
             }
 
@@ -62,6 +86,7 @@ namespace WandEnhancer.Core
 
             if (!ReadProcessMemory(process, start, block, block.Length, out int read) || read != block.Length)
             {
+                failure = $"fuse block is not readable yet (win32 {Marshal.GetLastWin32Error()}, read {read})";
                 return false;
             }
 
@@ -72,6 +97,7 @@ namespace WandEnhancer.Core
                 block[SentinelLength] != SupportedWireVersion ||
                 block[SentinelLength + 1] < MinFuseCount)
             {
+                failure = $"fuse block does not match the expected Electron image at 0x{start.ToInt64():X}";
                 return false;
             }
 
@@ -83,10 +109,15 @@ namespace WandEnhancer.Core
             var target = new IntPtr(imageBase.ToInt64() + stateRva);
             if (!VirtualProtectEx(process, target, (UIntPtr)1, PAGE_READWRITE, out uint previous))
             {
+                failure = $"fuse memory protection could not be changed (win32 {Marshal.GetLastWin32Error()})";
                 return false;
             }
 
             bool written = WriteProcessMemory(process, target, new[] { StateRemoved }, 1, out _);
+            if (!written)
+            {
+                failure = $"fuse byte could not be written (win32 {Marshal.GetLastWin32Error()})";
+            }
             VirtualProtectEx(process, target, (UIntPtr)1, previous, out _);
             return written;
         }
